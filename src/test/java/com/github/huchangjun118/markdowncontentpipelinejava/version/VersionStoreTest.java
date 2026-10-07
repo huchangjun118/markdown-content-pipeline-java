@@ -89,6 +89,10 @@ class VersionStoreTest {
     @Test
     void concurrentPublishAndRollbackIsDeterministic() throws Exception {
         TestFixture fx = fixture();
+        // Keep every version so that no rollback target can legitimately be
+        // archived mid-flight (the default retention of 30 is far below the
+        // number of versions this test publishes).
+        fx.properties.setVersionRetention(Integer.MAX_VALUE);
         publishVersion(fx, 0);
 
         int threads = 8;

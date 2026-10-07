@@ -118,6 +118,15 @@ public class VersionStore {
                     System.currentTimeMillis(), BuildVersion.State.ACTIVE);
 
             for (ContentProduct product : builtProducts.values()) {
+                ContentProduct existing = products.get(product.contentHash());
+                if (existing != null && !existing.equals(product)) {
+                    // A product identifier must never denote two different
+                    // products; refuse to publish rather than corrupt history.
+                    throw new IllegalStateException(
+                            "Content hash collision for " + product.contentHash()
+                                    + ": existing product " + existing.docId()
+                                    + " differs from new product " + product.docId());
+                }
                 products.put(product.contentHash(), product);
                 writeProduct(product);
             }

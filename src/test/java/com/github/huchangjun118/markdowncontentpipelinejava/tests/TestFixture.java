@@ -38,8 +38,18 @@ public class TestFixture {
     }
 
     public TestFixture(Path tempDir, PipelineProperties.MissingRefPolicy missingRefPolicy) {
-        this.sourceDir = tempDir.resolve("sources");
-        this.outputDir = tempDir.resolve("output");
+        this(tempDir.resolve("sources"), tempDir.resolve("output"), missingRefPolicy);
+    }
+
+    /**
+     * A fixture over explicit source/output directories. Sharing a source
+     * directory between two fixtures with different output directories allows
+     * comparing an incremental build against a from-scratch full build of the
+     * same sources (no shared cache or version state).
+     */
+    public TestFixture(Path sourceDir, Path outputDir, PipelineProperties.MissingRefPolicy missingRefPolicy) {
+        this.sourceDir = sourceDir;
+        this.outputDir = outputDir;
         try {
             Files.createDirectories(sourceDir);
             Files.createDirectories(outputDir);

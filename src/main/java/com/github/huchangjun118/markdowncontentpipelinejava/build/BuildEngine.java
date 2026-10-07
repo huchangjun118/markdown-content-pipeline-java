@@ -36,11 +36,13 @@ import java.util.concurrent.locks.ReentrantLock;
  * does not block reads and reads never observe a half-built state (versions are
  * published atomically).
  *
- * <p>Incremental builds rebuild only the changed documents and their directly or
- * transitively affected downstream documents; unaffected products keep their
- * identifiers and content hashes. The incremental result is identical to a full
- * build because every product hash is computed from its inputs and the same
- * deterministic rendering is used.
+ * <p>Incremental builds rebuild only the changed documents and the documents
+ * whose rendered output depends on them (include upstreams, and referrers whose
+ * links start or stop resolving); unaffected products keep their identifiers
+ * and content hashes. The incremental result is identical to a full build
+ * because every product identifier is computed from all of the product's
+ * inputs - own source, link resolution, and (transitively) included products -
+ * and rendering is deterministic.
  */
 @Component
 public class BuildEngine {
@@ -56,9 +58,6 @@ public class BuildEngine {
     private final VersionStore versionStore;
 
     private final ReentrantLock buildLock = new ReentrantLock();
-
-    /** Graph of the last successfully built version (used for delete propagation). */
-    private volatile DependencyGraph lastGraph;
 
     public BuildEngine(ChangeScanner scanner, MarkdownParser parser,
                        DependencyGraphBuilder graphBuilder, ProductHasher hasher,
@@ -86,14 +85,27 @@ public class BuildEngine {
                         List.of());
             }
 
-            List<ParsedDocument> documents = parseAll(files);
-            DependencyGraphBuilder.GraphBuildResult graphResult = graphBuilder.build(documents);
+            List<ParsedDocument> documents;
+            DependencyGraphBuilder.GraphBuildResult graphResult;
+            try {
+                documents = parseAll(files);
+                graphResult = graphBuilder.build(documents);
+            } catch (BuildFailureException e) {
+                log.warn("Full build failed: {} errors", e.errors.size());
+                return BuildReport.failure(e.errors, e.warnings);
+            }
             if (graphResult.hasErrors()) {
                 log.warn("Full build failed: {} errors", graphResult.errors().size());
                 return BuildReport.failure(graphResult.errors(), graphResult.warnings());
             }
 
-            BuildResult result = buildAll(documents, graphResult, Set.of(), BuildVersion.VersionType.FULL, null);
+            BuildResult result;
+            try {
+                result = buildAll(documents, graphResult, Set.of(), BuildVersion.VersionType.FULL, null);
+            } catch (BuildFailureException e) {
+                log.warn("Full build failed during rendering: {} errors", e.errors.size());
+                return BuildReport.failure(e.errors, e.warnings);
+            }
             BuildVersion published = publish(result, BuildVersion.VersionType.FULL, null);
             log.info("Full build finished: {} built, {} reused", result.built.size(), result.reused.size());
             return new BuildReport(true, published.versionId(), List.of(), graphResult.warnings(),
@@ -129,37 +141,76 @@ public class BuildEngine {
                         List.of(), List.of(), List.of());
             }
 
-            List<ParsedDocument> documents = parseAll(files);
-            DependencyGraphBuilder.GraphBuildResult graphResult = graphBuilder.build(documents);
+            List<ParsedDocument> documents;
+            DependencyGraphBuilder.GraphBuildResult graphResult;
+            try {
+                documents = parseAll(files);
+                graphResult = graphBuilder.build(documents);
+            } catch (BuildFailureException e) {
+                log.warn("Incremental build failed: {} errors; published version {} remains current",
+                        e.errors.size(), previous.versionId());
+                return BuildReport.failure(e.errors, e.warnings);
+            }
             if (graphResult.hasErrors()) {
                 log.warn("Incremental build failed: {} errors; published version {} remains current",
                         graphResult.errors().size(), previous.versionId());
                 return BuildReport.failure(graphResult.errors(), graphResult.warnings());
             }
 
-            // Determine affected documents
+            // Determine affected documents precisely:
+            // - ADDED/MODIFIED: the doc itself plus everything that transitively
+            //   includes it (its content feeds those products).
+            // - ADDED: also docs whose previously-missing links now resolve
+            //   (one reference hop; their rendered hrefs change), plus their
+            //   include upstreams.
+            // - DELETED: docs whose links resolved to the deleted path (found by
+            //   re-resolving every reference against the deleted paths, so this
+            //   works even after a restart), plus their include upstreams.
+            //   Docs that included the deleted file fail the build above with
+            //   MISSING_INCLUDE before reaching this point.
+            DependencyGraph graph = graphResult.graph();
+            Set<String> deletedPaths = new HashSet<>();
+            for (SourceChange change : changes) {
+                if (change.type() == SourceChange.Type.DELETED) {
+                    deletedPaths.add(change.relativePath());
+                }
+            }
+
             Set<DocId> affected = new HashSet<>();
             for (SourceChange change : changes) {
-                if (change.type() == SourceChange.Type.DELETED) {
-                    cache.evictDoc(change.docId());
-                    if (lastGraph != null) {
-                        affected.addAll(lastGraph.affectedDownstream(change.docId()));
+                switch (change.type()) {
+                    case ADDED -> {
+                        affected.add(change.docId());
+                        affected.addAll(graph.includeAffectedUpstream(change.docId()));
+                        for (DocId referrer : graph.directReferrers(change.docId())) {
+                            affected.add(referrer);
+                            affected.addAll(graph.includeAffectedUpstream(referrer));
+                        }
                     }
-                } else {
-                    affected.add(change.docId());
-                    affected.addAll(graphResult.graph().affectedDownstream(change.docId()));
+                    case MODIFIED -> {
+                        affected.add(change.docId());
+                        affected.addAll(graph.includeAffectedUpstream(change.docId()));
+                    }
+                    case DELETED -> cache.evictDoc(change.docId());
                 }
             }
-
-            Set<DocId> deletedIds = new HashSet<>();
-            for (SourceChange change : changes) {
-                if (change.type() == SourceChange.Type.DELETED) {
-                    deletedIds.add(change.docId());
+            if (!deletedPaths.isEmpty()) {
+                for (DocId referrer : referrersOfPaths(documents, deletedPaths)) {
+                    affected.add(referrer);
+                    affected.addAll(graph.includeAffectedUpstream(referrer));
                 }
             }
+            affected.removeAll(idsOf(changes, SourceChange.Type.DELETED));
 
-            BuildResult result = buildAll(documents, graphResult, affected,
-                    BuildVersion.VersionType.INCREMENTAL, previous);
+            BuildResult result;
+            try {
+                result = buildAll(documents, graphResult, affected,
+                        BuildVersion.VersionType.INCREMENTAL, previous);
+            } catch (BuildFailureException e) {
+                log.warn("Incremental build failed during rendering: {} errors; published version {} remains current",
+                        e.errors.size(), previous.versionId());
+                return BuildReport.failure(e.errors, e.warnings);
+            }
             BuildVersion published = publish(result, BuildVersion.VersionType.INCREMENTAL, previous);
             log.info("Incremental build finished: {} built, {} reused, {} affected",
                     result.built.size(), result.reused.size(), result.affected.size());
@@ -172,10 +223,52 @@ public class BuildEngine {
 
     private List<ParsedDocument> parseAll(List<SourceFile> files) {
         List<ParsedDocument> documents = new ArrayList<>();
+        List<BuildError> errors = new ArrayList<>();
         for (SourceFile f : files) {
-            documents.add(parser.parse(f.relativePath(), f.content()));
+            try {
+                documents.add(parser.parse(f.relativePath(), f.content()));
+            } catch (RuntimeException e) {
+                // A single unparseable document must not crash the build or
+                // corrupt the published version: report it locatably instead.
+                errors.add(BuildError.error(f.relativePath(), 0, BuildError.ErrorType.PARSE_ERROR,
+                        "Failed to parse '%s': %s".formatted(f.relativePath(), e.getMessage())));
+            }
+        }
+        if (!errors.isEmpty()) {
+            throw new BuildFailureException(errors, List.of());
         }
         return documents;
+    }
+
+    /**
+     * Finds every document that has an internal link resolving to one of the
+     * given (deleted) source paths. Resolution is recomputed from the current
+     * sources, so this is correct even with no in-memory state from previous
+     * builds (e.g. right after a restart).
+     */
+    private Set<DocId> referrersOfPaths(List<ParsedDocument> documents, Set<String> paths) {
+        Set<DocId> referrers = new HashSet<>();
+        for (ParsedDocument doc : documents) {
+            String dir = parentDir(doc.sourcePath());
+            for (ParsedDocument.RawRef ref : doc.references()) {
+                String resolved = DependencyGraphBuilder.resolveReference(ref.target(), dir);
+                if (paths.contains(resolved)) {
+                    referrers.add(doc.id());
+                    break;
+                }
+            }
+        }
+        return referrers;
+    }
+
+    private static Set<DocId> idsOf(List<SourceChange> changes, SourceChange.Type type) {
+        Set<DocId> ids = new HashSet<>();
+        for (SourceChange change : changes) {
+            if (change.type() == type) {
+                ids.add(change.docId());
+            }
+        }
+        return ids;
     }
 
     /**
@@ -200,6 +293,7 @@ public class BuildEngine {
         List<DocId> order = topologicalOrder(graph);
 
         Map<DocId, ContentProduct> products = new LinkedHashMap<>();
+        Map<DocId, String> hashes = new LinkedHashMap<>();
         List<DocId> built = new ArrayList<>();
         List<DocId> reused = new ArrayList<>();
         List<DocId> affected = new ArrayList<>();
@@ -208,11 +302,19 @@ public class BuildEngine {
         for (DocId id : order) {
             ParsedDocument doc = docById.get(id);
             Set<DocId> transitiveIncludes = graph.transitiveIncludes(id);
-            Map<DocId, ParsedDocument> includedSources = new HashMap<>();
-            for (DocId dep : transitiveIncludes) {
-                includedSources.put(dep, docById.get(dep));
+
+            // The product identifier covers every input of the rendered output:
+            // own identity and source, link resolution, and (transitively, via
+            // their own hashes) all included products.
+            Map<String, DocId> linkResolution = new HashMap<>();
+            for (ParsedDocument.RawRef ref : doc.references()) {
+                linkResolution.put(ref.target(), resolveLinkTarget(graphResult, doc, ref.target()));
             }
-            String contentHash = hasher.hashProduct(doc, includedSources);
+            Map<DocId, String> directIncludeHashes = new HashMap<>();
+            for (DocId dep : graph.includeEdges().get(id)) {
+                directIncludeHashes.put(dep, hashes.get(dep));
+            }
+            String contentHash = hasher.hashProduct(doc, linkResolution, directIncludeHashes);
 
             boolean mustRebuild = forcedRebuild.contains(id);
             ContentProduct product = null;
@@ -234,10 +336,19 @@ public class BuildEngine {
                 for (DocId dep : graph.includeEdges().get(id)) {
                     directIncludes.put(dep, products.get(dep));
                 }
-                product = contentBuilder.build(doc, directIncludes,
-                        target -> resolveIncludeTarget(graphResult, doc, target),
-                        target -> resolveLinkTarget(graphResult, doc, target),
-                        contentHash, transitiveIncludes);
+                try {
+                    product = contentBuilder.build(doc, directIncludes,
+                            target -> resolveIncludeTarget(graphResult, doc, target),
+                            target -> resolveLinkTarget(graphResult, doc, target),
+                            contentHash, transitiveIncludes);
+                } catch (RuntimeException e) {
+                    // A single broken document must not corrupt the build or the
+                    // published version: fail the build with a locatable error.
+                    throw new BuildFailureException(List.of(BuildError.error(
+                            doc.sourcePath(), 0, BuildError.ErrorType.RENDER_ERROR,
+                            "Failed to render '%s': %s".formatted(doc.sourcePath(), e.getMessage()))),
+                            List.of());
+                }
                 cache.put(id, contentHash, product);
                 built.add(id);
                 if (mustRebuild) {
@@ -248,6 +359,7 @@ public class BuildEngine {
             }
 
             products.put(id, product);
+            hashes.put(id, contentHash);
             manifest.put(id, contentHash);
         }
 
@@ -263,7 +375,6 @@ public class BuildEngine {
                 hasher.hashSourceTree(currentFileHashes(documents)),
                 0L, BuildVersion.State.ACTIVE);
 
-        lastGraph = graph;
         return new BuildResult(products, published, built, reused, affected);
     }
 
@@ -344,6 +455,18 @@ public class BuildEngine {
 
     private BuildVersion publish(BuildResult result, BuildVersion.VersionType type, BuildVersion previous) {
         return versionStore.publish(result.published, result.products);
+    }
+
+    /** Carries locatable build errors out of the build pipeline stages. */
+    private static final class BuildFailureException extends RuntimeException {
+        private final List<BuildError> errors;
+        private final List<BuildError> warnings;
+
+        private BuildFailureException(List<BuildError> errors, List<BuildError> warnings) {
+            super(errors.toString());
+            this.errors = errors;
+            this.warnings = warnings;
+        }
     }
 
     private record BuildResult(Map<DocId, ContentProduct> products, BuildVersion published,
