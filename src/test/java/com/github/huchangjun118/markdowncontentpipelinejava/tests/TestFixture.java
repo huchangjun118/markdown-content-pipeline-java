@@ -38,6 +38,10 @@ public class TestFixture {
     }
 
     public TestFixture(Path tempDir, PipelineProperties.MissingRefPolicy missingRefPolicy) {
+        this(tempDir, missingRefPolicy, 1000);
+    }
+
+    public TestFixture(Path tempDir, PipelineProperties.MissingRefPolicy missingRefPolicy, int cacheMaxEntries) {
         this.sourceDir = tempDir.resolve("sources");
         this.outputDir = tempDir.resolve("output");
         try {
@@ -50,6 +54,7 @@ public class TestFixture {
         properties.setSourceDir(sourceDir.toString());
         properties.setOutputDir(outputDir.toString());
         properties.setMissingRefPolicy(missingRefPolicy);
+        properties.setCacheMaxEntries(cacheMaxEntries);
 
         scanner = new ChangeScanner(properties);
         parser = new MarkdownParser();

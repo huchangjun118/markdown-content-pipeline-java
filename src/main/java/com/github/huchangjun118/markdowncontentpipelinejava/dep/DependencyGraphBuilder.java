@@ -14,6 +14,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 
 /**
  * Resolves raw references between documents into a complete dependency graph,
@@ -31,6 +32,9 @@ import java.util.Set;
 @Component
 public class DependencyGraphBuilder {
 
+    /** Resolution recorded for an include/reference target that does not exist. */
+    public static final String UNRESOLVED = "\u0000unresolved\u0000";
+
     private final PipelineProperties properties;
 
     public DependencyGraphBuilder(PipelineProperties properties) {
@@ -40,6 +44,10 @@ public class DependencyGraphBuilder {
     public record GraphBuildResult(DependencyGraph graph,
                                    Map<DocId, String> pathByDocId,
                                    Map<String, DocId> docIdByPath,
+                                   /** doc id -> raw include target -> resolved doc id, or {@link #UNRESOLVED} */
+                                   Map<DocId, Map<String, String>> includeResolutions,
+                                   /** doc id -> raw reference target -> resolved doc id, or {@link #UNRESOLVED} */
+                                   Map<DocId, Map<String, String>> referenceResolutions,
                                    List<BuildError> errors,
                                    List<BuildError> warnings) {
         public boolean hasErrors() {
@@ -71,10 +79,14 @@ public class DependencyGraphBuilder {
         Map<DocId, Set<DocId>> includeEdges = new LinkedHashMap<>();
         Map<DocId, Set<DocId>> referenceEdges = new LinkedHashMap<>();
         Map<DocId, Map<DocId, Integer>> includeLines = new HashMap<>();
+        Map<DocId, Map<String, String>> includeResolutions = new LinkedHashMap<>();
+        Map<DocId, Map<String, String>> referenceResolutions = new LinkedHashMap<>();
         for (ParsedDocument doc : documents) {
             includeEdges.put(doc.id(), new HashSet<>());
             referenceEdges.put(doc.id(), new HashSet<>());
             includeLines.put(doc.id(), new HashMap<>());
+            includeResolutions.put(doc.id(), new TreeMap<>());
+            referenceResolutions.put(doc.id(), new TreeMap<>());
         }
 
         for (ParsedDocument doc : documents) {
@@ -84,12 +96,14 @@ public class DependencyGraphBuilder {
                 String resolved = resolveInclude(ref.target(), dir);
                 DocId targetId = docIdByPath.get(resolved);
                 if (targetId == null) {
+                    includeResolutions.get(doc.id()).put(ref.target(), UNRESOLVED);
                     errors.add(BuildError.error(doc.sourcePath(), ref.line(),
                             BuildError.ErrorType.MISSING_INCLUDE,
                             "Included document '%s' (resolved to '%s') does not exist"
                                     .formatted(ref.target(), resolved)));
                     continue;
                 }
+                includeResolutions.get(doc.id()).put(ref.target(), targetId.value());
                 if (targetId.equals(doc.id())) {
                     errors.add(BuildError.error(doc.sourcePath(), ref.line(),
                             BuildError.ErrorType.INCLUDE_CYCLE,
@@ -104,6 +118,7 @@ public class DependencyGraphBuilder {
                 String resolved = resolveReference(ref.target(), dir);
                 DocId targetId = docIdByPath.get(resolved);
                 if (targetId == null) {
+                    referenceResolutions.get(doc.id()).put(ref.target(), UNRESOLVED);
                     BuildError be = BuildError.error(doc.sourcePath(), ref.line(),
                             BuildError.ErrorType.MISSING_REFERENCE,
                             "Referenced document '%s' (resolved to '%s') does not exist"
@@ -115,6 +130,7 @@ public class DependencyGraphBuilder {
                     }
                     continue;
                 }
+                referenceResolutions.get(doc.id()).put(ref.target(), targetId.value());
                 referenceEdges.get(doc.id()).add(targetId);
             }
         }
@@ -124,7 +140,15 @@ public class DependencyGraphBuilder {
 
         return new GraphBuildResult(
                 new DependencyGraph(includeEdges, referenceEdges, Set.copyOf(includeEdges.keySet())),
-                pathByDocId, docIdByPath, errors, warnings);
+                pathByDocId, docIdByPath,
+                deepUnmodifiable(includeResolutions), deepUnmodifiable(referenceResolutions),
+                errors, warnings);
+    }
+
+    private static Map<DocId, Map<String, String>> deepUnmodifiable(Map<DocId, Map<String, String>> in) {
+        Map<DocId, Map<String, String>> out = new LinkedHashMap<>();
+        in.forEach((k, v) -> out.put(k, Map.copyOf(v)));
+        return Map.copyOf(out);
     }
 
     private void detectIncludeCycles(List<ParsedDocument> documents,

@@ -21,7 +21,6 @@ import org.springframework.stereotype.Component;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -57,9 +56,6 @@ public class BuildEngine {
 
     private final ReentrantLock buildLock = new ReentrantLock();
 
-    /** Graph of the last successfully built version (used for delete propagation). */
-    private volatile DependencyGraph lastGraph;
-
     public BuildEngine(ChangeScanner scanner, MarkdownParser parser,
                        DependencyGraphBuilder graphBuilder, ProductHasher hasher,
                        ContentBuilder contentBuilder, BuildCache cache,
@@ -93,7 +89,10 @@ public class BuildEngine {
                 return BuildReport.failure(graphResult.errors(), graphResult.warnings());
             }
 
-            BuildResult result = buildAll(documents, graphResult, Set.of(), BuildVersion.VersionType.FULL, null);
+            BuildResult result = buildAll(documents, graphResult, Map.of(), BuildVersion.VersionType.FULL, null);
+            if (!result.errors().isEmpty()) {
+                return BuildReport.failure(result.errors(), graphResult.warnings());
+            }
             BuildVersion published = publish(result, BuildVersion.VersionType.FULL, null);
             log.info("Full build finished: {} built, {} reused", result.built.size(), result.reused.size());
             return new BuildReport(true, published.versionId(), List.of(), graphResult.warnings(),
@@ -137,29 +136,29 @@ public class BuildEngine {
                 return BuildReport.failure(graphResult.errors(), graphResult.warnings());
             }
 
-            // Determine affected documents
-            Set<DocId> affected = new HashSet<>();
+            // Products of deleted documents can never be referenced again by
+            // their doc id; drop them from the build cache promptly.
             for (SourceChange change : changes) {
                 if (change.type() == SourceChange.Type.DELETED) {
                     cache.evictDoc(change.docId());
-                    if (lastGraph != null) {
-                        affected.addAll(lastGraph.affectedDownstream(change.docId()));
-                    }
-                } else {
-                    affected.add(change.docId());
-                    affected.addAll(graphResult.graph().affectedDownstream(change.docId()));
                 }
             }
 
-            Set<DocId> deletedIds = new HashSet<>();
-            for (SourceChange change : changes) {
-                if (change.type() == SourceChange.Type.DELETED) {
-                    deletedIds.add(change.docId());
-                }
-            }
-
-            BuildResult result = buildAll(documents, graphResult, affected,
+            // The affected set is derived purely from product fingerprints:
+            // a document is affected iff its new hash differs from the hash the
+            // previous committed version records for it (or it is new). Because
+            // the fingerprint covers reference/include resolution in the whole
+            // render closure, deleting, renaming or re-adding a referenced
+            // document changes every referencing document's hash even when its
+            // own bytes are untouched. This does not rely on any in-memory
+            // graph, so it stays correct after restarts and rollbacks.
+            BuildResult result = buildAll(documents, graphResult, previous.manifest(),
                     BuildVersion.VersionType.INCREMENTAL, previous);
+            if (!result.errors().isEmpty()) {
+                log.warn("Incremental render failed: {} error(s); published version {} remains current",
+                        result.errors().size(), previous.versionId());
+                return BuildReport.failure(result.errors(), graphResult.warnings());
+            }
             BuildVersion published = publish(result, BuildVersion.VersionType.INCREMENTAL, previous);
             log.info("Incremental build finished: {} built, {} reused, {} affected",
                     result.built.size(), result.reused.size(), result.affected.size());
@@ -181,15 +180,21 @@ public class BuildEngine {
     /**
      * Builds all documents in deterministic topological (include-first) order.
      *
-     * @param forcedRebuild docs that must be rebuilt even if unchanged (incremental affected set);
-     *                      empty for full builds (everything is built or reused from cache).
+     * @param previousManifest manifest of the version this build extends
+     *                         (empty for full builds). A document is rebuilt
+     *                         only when its newly computed fingerprint differs
+     *                         from the one recorded there; otherwise the exact
+     *                         previously published product is reused.
      */
     private BuildResult buildAll(List<ParsedDocument> documents,
                                  DependencyGraphBuilder.GraphBuildResult graphResult,
-                                 Set<DocId> forcedRebuild,
+                                 Map<DocId, String> previousManifest,
                                  BuildVersion.VersionType type,
                                  BuildVersion previous) {
         DependencyGraph graph = graphResult.graph();
+        ProductHasher.ResolutionTables resolutions = new ProductHasher.ResolutionTables(
+                graphResult.includeResolutions(), graphResult.referenceResolutions());
+
         Map<DocId, ParsedDocument> docById = new LinkedHashMap<>();
         for (ParsedDocument doc : documents) {
             docById.put(doc.id(), doc);
@@ -203,6 +208,7 @@ public class BuildEngine {
         List<DocId> built = new ArrayList<>();
         List<DocId> reused = new ArrayList<>();
         List<DocId> affected = new ArrayList<>();
+        List<BuildError> errors = new ArrayList<>();
         Map<DocId, String> manifest = new LinkedHashMap<>();
 
         for (DocId id : order) {
@@ -212,21 +218,20 @@ public class BuildEngine {
             for (DocId dep : transitiveIncludes) {
                 includedSources.put(dep, docById.get(dep));
             }
-            String contentHash = hasher.hashProduct(doc, includedSources);
+            List<DocId> closure = ProductHasher.closure(doc, includedSources);
+            String contentHash = hasher.hashProduct(doc, includedSources, closure, resolutions);
 
-            boolean mustRebuild = forcedRebuild.contains(id);
+            String previousHash = previousManifest.get(id);
+            boolean unchanged = contentHash.equals(previousHash);
+
             ContentProduct product = null;
-
-            if (!mustRebuild) {
-                // 1) build cache (content-addressed)
+            if (unchanged && previous != null) {
+                // Fingerprint identical to the committed version: reuse the
+                // exact published product so identifier and content stay equal.
+                product = versionStore.productByHash(contentHash).orElse(null);
+            }
+            if (product == null) {
                 product = cache.get(id, contentHash).orElse(null);
-                // 2) previously published product (incremental reuse)
-                if (product == null && previous != null) {
-                    String prevHash = previous.manifest().get(id);
-                    if (prevHash != null && prevHash.equals(contentHash)) {
-                        product = versionStore.productByHash(contentHash).orElse(null);
-                    }
-                }
             }
 
             if (product == null) {
@@ -234,26 +239,29 @@ public class BuildEngine {
                 for (DocId dep : graph.includeEdges().get(id)) {
                     directIncludes.put(dep, products.get(dep));
                 }
-                product = contentBuilder.build(doc, directIncludes,
-                        target -> resolveIncludeTarget(graphResult, doc, target),
-                        target -> resolveLinkTarget(graphResult, doc, target),
-                        contentHash, transitiveIncludes);
+                try {
+                    product = contentBuilder.build(doc, directIncludes,
+                            target -> resolveIncludeTarget(graphResult, doc, target),
+                            target -> resolveLinkTarget(graphResult, doc, target),
+                            contentHash, transitiveIncludes);
+                } catch (RuntimeException e) {
+                    errors.add(BuildError.error(doc.sourcePath(), 0, BuildError.ErrorType.RENDER_ERROR,
+                            "Failed to render document '%s': %s".formatted(doc.sourcePath(), e.getMessage())));
+                    break;
+                }
                 cache.put(id, contentHash, product);
                 built.add(id);
-                if (mustRebuild) {
-                    affected.add(id);
-                }
             } else {
                 reused.add(id);
             }
 
             products.put(id, product);
             manifest.put(id, contentHash);
+            if (previousHash == null || !previousHash.equals(contentHash)) {
+                affected.add(id);
+            }
         }
 
-        // In incremental mode, carry over unchanged products from the previous
-        // version that are not in the current graph (should not happen for
-        // non-deleted docs, but keeps the manifest complete).
         BuildVersion published = new BuildVersion(
                 0L, type,
                 previous == null ? null : previous.versionId(),
@@ -263,8 +271,7 @@ public class BuildEngine {
                 hasher.hashSourceTree(currentFileHashes(documents)),
                 0L, BuildVersion.State.ACTIVE);
 
-        lastGraph = graph;
-        return new BuildResult(products, published, built, reused, affected);
+        return new BuildResult(products, published, built, reused, affected, errors);
     }
 
     private Map<String, String> currentFileHashes(List<ParsedDocument> documents) {
@@ -297,7 +304,7 @@ public class BuildEngine {
         if (query >= 0) target = target.substring(0, query);
         if (!target.endsWith(".md")) return null;
         String dir = parentDir(doc.sourcePath());
-        String resolved = DependencyGraphBuilder.resolveReference(rawTarget, dir);
+        String resolved = DependencyGraphBuilder.resolveReference(target, dir);
         return graphResult.docIdByPath().get(resolved);
     }
 
@@ -347,6 +354,7 @@ public class BuildEngine {
     }
 
     private record BuildResult(Map<DocId, ContentProduct> products, BuildVersion published,
-                               List<DocId> built, List<DocId> reused, List<DocId> affected) {
+                               List<DocId> built, List<DocId> reused, List<DocId> affected,
+                               List<BuildError> errors) {
     }
 }

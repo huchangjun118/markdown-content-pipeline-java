@@ -118,6 +118,17 @@ public class VersionStore {
                     System.currentTimeMillis(), BuildVersion.State.ACTIVE);
 
             for (ContentProduct product : builtProducts.values()) {
+                // Hard invariant: one product identifier must never map to two
+                // different contents. An identical product published
+                // concurrently (same hash, same content) is an idempotent no-op.
+                ContentProduct existing = products.get(product.contentHash());
+                if (existing != null && !sameContent(existing, product)) {
+                    throw new IllegalStateException(
+                            "Product identifier collision for hash " + product.contentHash()
+                                    + ": existing doc '" + existing.docId()
+                                    + "' vs new doc '" + product.docId()
+                                    + "' with different content; refusing to publish");
+                }
                 products.put(product.contentHash(), product);
                 writeProduct(product);
             }
@@ -267,11 +278,31 @@ public class VersionStore {
     private void writeProduct(ContentProduct product) {
         try {
             Path f = productsDir.resolve(product.contentHash() + ".json");
-            if (Files.exists(f)) return;
+            if (Files.exists(f)) {
+                // A file for this identifier already exists. It must serialize
+                // exactly the same product, otherwise history on disk would be
+                // silently corrupted after a restart.
+                ContentProduct onDisk = objectMapper.readValue(f.toFile(), ContentProduct.class);
+                if (!sameContent(onDisk, product)) {
+                    throw new IllegalStateException(
+                            "Product file " + f.getFileName() + " already exists with different content; "
+                                    + "identifier " + product.contentHash() + " is not unique");
+                }
+                return;
+            }
             objectMapper.writerWithDefaultPrettyPrinter().writeValue(f.toFile(), product);
         } catch (IOException e) {
             throw new IllegalStateException("Failed to write product " + product.docId(), e);
         }
+    }
+
+    /** Two products with the same identifier are valid only if their full content matches. */
+    private static boolean sameContent(ContentProduct a, ContentProduct b) {
+        return a.docId().equals(b.docId())
+                && java.util.Objects.equals(a.sourcePath(), b.sourcePath())
+                && java.util.Objects.equals(a.title(), b.title())
+                && java.util.Objects.equals(a.html(), b.html())
+                && java.util.Objects.equals(a.dependencies(), b.dependencies());
     }
 
     private void writeVersion(BuildVersion version) {
